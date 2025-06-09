@@ -1,6 +1,13 @@
-import axios from "axios";
-import yts from "yt-search";
+import fetch from 'node-fetch';
+import ytSearch from 'yt-search';
+import fs from 'fs';
+import { pipeline } from 'stream';
+import { promisify } from 'util';
+import osCallbacks from 'os';
 import config from "../config.cjs";
+
+const streamPipeline = promisify(pipeline);
+const tmpDir = osCallbacks.tmpdir();
 
 const song = async (m, Matrix) => {
   try {
@@ -12,7 +19,7 @@ const song = async (m, Matrix) => {
       if (args.length === 0 || !args.join(" ")) {
         return Matrix.sendMessage(m.from, {
           text: `◈━━━━━━━━━━━━━━━━◈
-│❒ Yo, *Toxic-MD* needs a song name or keywords, fam! 🎵
+│❒ Give me a song name or keywords to search 😎
 ◈━━━━━━━━━━━━━━━━◈`,
         }, { quoted: m });
       }
@@ -20,11 +27,12 @@ const song = async (m, Matrix) => {
       const searchQuery = args.join(" ");
       await Matrix.sendMessage(m.from, {
         text: `◈━━━━━━━━━━━━━━━━◈
-│❒ *Toxic-MD* huntin’ for "${searchQuery}"... 🎥🔍
+│❒ *Toxic-MD* huntin’ for "${searchQuery}"... 🎧
 ◈━━━━━━━━━━━━━━━━◈`,
       }, { quoted: m });
 
-      const searchResults = await yts(searchQuery);
+      // Search YouTube for song info
+      const searchResults = await ytSearch(searchQuery);
       if (!searchResults.videos || searchResults.videos.length === 0) {
         return Matrix.sendMessage(m.from, {
           text: `◈━━━━━━━━━━━━━━━━◈
@@ -33,61 +41,96 @@ const song = async (m, Matrix) => {
         }, { quoted: m });
       }
 
-      const firstResult = searchResults.videos[0];
-      const videoUrl = firstResult.url;
+      const song = searchResults.videos[0];
+      const safeTitle = song.title.replace(/[^\w\s]/gi, '').replace(/\s+/g, '_').substring(0, 100);
+      const filePath = `${tmpDir}/${safeTitle}.mp3`;
 
-      // Fetch video using API
-      const apiUrl = `https://apis.davidcyriltech.my.id/youtube/mp4?url=${videoUrl}`;
-      let response;
+      // Fetch download URL from the new API
+      let apiResponse;
       try {
-        response = await axios.get(apiUrl);
-        console.log(`API response:`, JSON.stringify(response.data, null, 2)); // Debug log
+        const apiUrl = `https://api.giftedtech.web.id/api/download/dlmp3?apikey=gifted_api_se5dccy&url=${encodeURIComponent(song.url)}`;
+        apiResponse = await fetch(apiUrl);
+        if (!apiResponse.ok) {
+          throw new Error(`API responded with status: ${apiResponse.status}`);
+        }
+        const data = await apiResponse.json();
+        if (!data.success || !data.result.download_url) {
+          throw new Error('API response missing download URL or failed');
+        }
+
+        // Send song info from yt-search and API
+        const songInfo = `
+◈━━━━━━━━━━━━━━━━◈
+│❒ *Toxic-MD* Song Intel 🔥
+│❒ *Title*: ${song.title}
+│❒ *Views*: ${song.views.toLocaleString()}
+│❒ *Duration*: ${song.timestamp}
+│❒ *Channel*: ${song.author.name}
+│❒ *Quality*: ${data.result.quality}
+│❒ *Uploaded*: ${song.ago}
+│❒ *URL*: ${song.url}
+◈━━━━━━━━━━━━━━━━◈`;
+        await Matrix.sendMessage(m.from, { text: songInfo }, { quoted: m });
+
+        // Download the audio file
+        const downloadResponse = await fetch(data.result.download_url);
+        if (!downloadResponse.ok) {
+          throw new Error(`Failed to download audio: ${downloadResponse.status}`);
+        }
+        const fileStream = fs.createWriteStream(filePath);
+        await streamPipeline(downloadResponse.body, fileStream);
       } catch (apiError) {
         console.error(`API error:`, apiError.message);
         return Matrix.sendMessage(m.from, {
           text: `◈━━━━━━━━━━━━━━━━◈
-│❒ *Toxic-MD* couldn’t fetch "${searchQuery}". API’s actin’ weak! 😡
+│❒ *Toxic-MD* couldn’t hit the API for "${song.title}". Server’s actin’ up! 😡
 ◈━━━━━━━━━━━━━━━━◈`,
         }, { quoted: m });
       }
 
-      if (!response.data?.success || !response.data?.result) {
-        console.error(`Invalid API response:`, response.data);
+      // Send the audio file
+      try {
+        const doc = {
+          audio: {
+            url: filePath,
+          },
+          mimetype: 'audio/mpeg',
+          ptt: false,
+          fileName: `${safeTitle}.mp3`,
+        };
+        await Matrix.sendMessage(m.from, doc, { quoted: m });
+
+        // Clean up temp file after 5 seconds
+        setTimeout(() => {
+          try {
+            if (fs.existsSync(filePath)) {
+              fs.unlinkSync(filePath);
+              console.log(`Deleted temp file: ${filePath}`);
+            }
+          } catch (cleanupErr) {
+            console.error('Error during file cleanup:', cleanupErr);
+          }
+        }, 5000);
+      } catch (sendError) {
+        console.error(`Failed to send audio:`, sendError.message);
         return Matrix.sendMessage(m.from, {
           text: `◈━━━━━━━━━━━━━━━━◈
-│❒ *Toxic-MD* got junk data for "${searchQuery}". API’s trash! 😤
+│❒ *Toxic-MD* can’t song "${song.title}". Failed to send audio 😣
 ◈━━━━━━━━━━━━━━━━◈`,
         }, { quoted: m });
       }
 
-      const { title, download_url } = response.data.result;
-      if (!title || !download_url) {
-        console.error(`Missing title or download_url:`, response.data.result);
-        return Matrix.sendMessage(m.from, {
-          text: `◈━━━━━━━━━━━━━━━━◈
-│❒ *Toxic-MD* can’t play "${searchQuery}". No video link, fam! 😣
+      await Matrix.sendMessage(m.from, {
+        text: `◈━━━━━━━━━━━━━━━━◈
+│❒ *${song.title}* dropped by *Toxic-MD*! Blast it! 🎶
 ◈━━━━━━━━━━━━━━━━◈`,
-        }, { quoted: m });
-      }
-
-      // Send the video file
-      await Matrix.sendMessage(
-        m.from,
-        {
-          video: { url: download_url },
-          mimetype: "video/mp4",
-          caption: `◈━━━━━━━━━━━━━━━━◈
-│❒ *${title}* dropped by *Toxic-MD*! Blast it, fam! 🎬🔥
-◈━━━━━━━━━━━━━━━━◈`,
-        },
-        { quoted: m }
-      );
+      }, { quoted: m });
     }
   } catch (error) {
-    console.error(`❌ Song error: ${error.message}`);
+    console.error(`❌ song error: ${error.message}`);
     await Matrix.sendMessage(m.from, {
       text: `◈━━━━━━━━━━━━━━━━◈
-│❒ *Toxic-MD* hit a snag, fam! Try another track! 😈
+│❒ *Toxic-MD* hit a snag, fam! Try again or pick a better track! 😈
 ◈━━━━━━━━━━━━━━━━◈`,
     }, { quoted: m });
   }
